@@ -115,8 +115,7 @@ def draw_bboxes(img, boxes, classes):
 
 if __name__ == "__main__":
 
-    # Capture complete start
-    completeStart = time.time()
+
 
     parser = argparse.ArgumentParser()
     parser.add_argument('-a', "--access_key_id", help="AWS Access key id")
@@ -158,15 +157,17 @@ if __name__ == "__main__":
 
     bucket = s3.Bucket(args.bucket)
 
-    l = open(args.log, "w")
+    l = open(args.log, "a")
 
     l.write(
-        "key, download_time, chip_time, inference_time, rescale_time, complete_time\n")
+        "time, key, download_time, chip_time, inference_time, rescale_time, complete_time\n")
     for o in bucket.objects.filter(Prefix=args.prefix):
 
         basename = os.path.basename(o.key)
         if o.key.endswith(".tif") and not (os.path.exists(basename + '.predictions.txt')):
 
+            completeStart = time.time()
+            
             # Download content to memory object
             downloadStart = time.time()
             response = o.get()
@@ -250,5 +251,5 @@ if __name__ == "__main__":
             rescale_time = rescaleEnd - rescaleStart
             complete_time = completeEnd - completeStart
 
-            l.write(",".join(list(map(lambda x: str(x), [
+            l.write(",".join(list(map(lambda x: str(x), [time.time(),
                     key, download_time, chip_time, inference_time, rescale_time, complete_time]))) + "\n")
