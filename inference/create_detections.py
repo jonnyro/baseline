@@ -253,3 +253,6 @@ if __name__ == "__main__":
 
             l.write(",".join(list(map(lambda x: str(x), [time.time(),
                     key, download_time, chip_time, inference_time, rescale_time, complete_time]))) + "\n")
+
+    l.close()
+    print("Done\n")
