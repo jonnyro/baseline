@@ -28,6 +28,7 @@ import boto3
 import io
 import os
 import time
+import sys
 
 """
 Inference script to generate a file of predictions given an input.
@@ -48,7 +49,7 @@ Args:
 Outputs:
     Writes a file specified by the 'output' parameter containing predictions for the model.
         Per-line format:  xmin ymin xmax ymax class_prediction score_prediction
-        Note that the variable "num_preds" is dependent on the trained model 
+        Note that the variable "num_preds" is dependent on the trained model
         (default is 250, but other models have differing numbers of predictions)
 
 """
@@ -112,9 +113,82 @@ def draw_bboxes(img, boxes, classes):
             draw.rectangle(((xmin+j, ymin+j), (xmax+j, ymax+j)), outline="red")
     return source
 
+def processChip(data):
+    global chipStart, chipEnd, detectionStart, detectionEnd, rescaleStart, rescaleEnd
+
+    # Capture chip start timing
+    chipStart = time.time()
+
+    # Parse and chip images
+    img = Image.open(data) if type(data) is str else Image.open(io.BytesIO(data))
+    arr = np.array(img)
+    chip_size = (args.chip_size, args.chip_size)
+    images = chip_image(arr, chip_size)
+    print("\n" + str(images.shape))
+    sys.stdout.flush()
+
+    # Capture timing
+    chipEnd = time.time()
+
+    # generate detections
+    detectionStart = time.time()
+    boxes, scores, classes = generate_detections(
+        detection_graph, images)
+    detectionEnd = time.time()
+
+    rescaleStart = time.time()
+
+    # Process boxes to be full-sized
+    width, height, _ = arr.shape
+    cwn, chn = (chip_size)
+    wn, hn = (int(width/cwn), int(height/chn))
+
+    num_preds = 250
+    bfull = boxes[:wn*hn].reshape((wn, hn, num_preds, 4))
+    b2 = np.zeros(bfull.shape)
+    b2[:, :, :, 0] = bfull[:, :, :, 1]
+    b2[:, :, :, 1] = bfull[:, :, :, 0]
+    b2[:, :, :, 2] = bfull[:, :, :, 3]
+    b2[:, :, :, 3] = bfull[:, :, :, 2]
+
+    bfull = b2
+    bfull[:, :, :, 0] *= cwn
+    bfull[:, :, :, 2] *= cwn
+    bfull[:, :, :, 1] *= chn
+    bfull[:, :, :, 3] *= chn
+    for i in range(wn):
+        for j in range(hn):
+            bfull[i, j, :, 0] += j*cwn
+            bfull[i, j, :, 2] += j*cwn
+
+            bfull[i, j, :, 1] += i*chn
+            bfull[i, j, :, 3] += i*chn
+
+    bfull = bfull.reshape((hn*wn, num_preds, 4))
+
+    rescaleEnd = time.time()
+
+    #only display boxes with confidence > .5
+    if type(data) is str:
+        bs = bfull[scores > .5]
+        cs = classes[scores>.5]
+        s = data.split("\\")[::-1]
+        os.makedirs("bboxes", exist_ok=True)
+        draw_bboxes(arr,bs,cs).save("bboxes\\"+s[0].split(".")[0] + ".png")
+
+    with open(basename + '.predictions.txt', 'w') as f:
+        for i in range(bfull.shape[0]):
+            for j in range(bfull[i].shape[0]):
+                # box should be xmin ymin xmax ymax
+                box = bfull[i, j]
+                class_prediction = classes[i, j]
+                score_prediction = scores[i, j]
+                f.write('%d %d %d %d %d %f \n' %
+                        (box[0], box[1], box[2], box[3], int(class_prediction), score_prediction))
+
 
 if __name__ == "__main__":
-
+    global chipStart, chipEnd, detectionStart, detectionEnd
 
 
     parser = argparse.ArgumentParser()
@@ -128,11 +202,13 @@ if __name__ == "__main__":
                         default='pbs/model.pb', help="Path to saved model")
     parser.add_argument("-cs", "--chip_size", default=300,
                         type=int, help="Size in pixels to chip input image")
+    parser.add_argument("-d", "--dir", help="Path to test chip directory")
 
     #parser.add_argument("-o","--output",default="predictions.txt",help="Filepath of desired output")
     args = parser.parse_args()
 
     print("Creating Graph...")
+    sys.stdout.flush()
     detection_graph = tf.Graph()
     with detection_graph.as_default():
         od_graph_def = tf.GraphDef()
@@ -146,110 +222,67 @@ if __name__ == "__main__":
     classes = []
     k = 0
 
-    # Establish aws session
-    session = boto3.Session(
-        aws_access_key_id=args.access_key_id,
-        aws_secret_access_key=args.secret_key,
-        region_name=args.region
-    )
+    if (not args.dir):
+        # Establish aws session
+        session = boto3.Session(
+            aws_access_key_id=args.access_key_id,
+            aws_secret_access_key=args.secret_key,
+            region_name=args.region
+        )
 
-    s3 = session.resource('s3')
+        s3 = session.resource('s3')
 
-    bucket = s3.Bucket(args.bucket)
+        bucket = s3.Bucket(args.bucket)
 
     l = open(args.log, "a")
-
     l.write(
         "time, key, download_time, chip_time, inference_time, rescale_time, complete_time\n")
-    for o in bucket.objects.filter(Prefix=args.prefix):
+    l.close()
 
-        basename = os.path.basename(o.key)
-        if o.key.endswith(".tif") and not (os.path.exists(basename + '.predictions.txt')):
+    if (not args.dir):
+        for o in bucket.objects.filter(Prefix=args.prefix):
+            basename = os.path.basename(o.key)
+            if o.key.endswith(".tif") and not (os.path.exists(basename + '.predictions.txt')):
 
-            completeStart = time.time()
-            
-            # Download content to memory object
-            downloadStart = time.time()
-            response = o.get()
-            data = response['Body'].read()
-            downloadEnd = time.time()
+                completeStart = time.time()
 
-            # Capture chip start timing
-            chipStart = time.time()
+                # Download content to memory object
+                downloadStart = time.time()
+                response = o.get()
+                data = response['Body'].read()
+                downloadEnd = time.time()
 
-            # Parse and chip images
-            arr = np.array(Image.open(io.BytesIO(data)))
-            chip_size = (args.chip_size, args.chip_size)
-            images = chip_image(arr, chip_size)
-            print(images.shape)
+                processChip(data)
 
-            # Capture timing
-            chipEnd = time.time()
+                completeEnd = time.time()
 
-            # generate detections
-            detectionStart = time.time()
-            boxes, scores, classes = generate_detections(
-                detection_graph, images)
-            detectionEnd = time.time()
+                key = o.key
+                download_time = downloadEnd - downloadStart
+                chip_time = chipEnd - chipStart
+                inference_time = detectionEnd - detectionStart
+                rescale_time = rescaleEnd - rescaleStart
+                complete_time = completeEnd - completeStart
 
-            rescaleStart = time.time()
+                l = open(args.log, "a")
+                l.write(",".join(list(map(lambda x: str(x), [time.time(),
+                        key, download_time, chip_time, inference_time, rescale_time, complete_time]))) + "\n")
+                l.close()
+    else:
+        for f in os.listdir(args.dir):
+            basename = os.path.basename(f)
+            if f.endswith(".tif") and not (os.path.exists(basename + '.predictions.txt')):
 
-            # Process boxes to be full-sized
-            width, height, _ = arr.shape
-            cwn, chn = (chip_size)
-            wn, hn = (int(width/cwn), int(height/chn))
+                completeStart = time.time()
+                processChip(os.path.join(args.dir, f))
+                completeEnd = time.time()
 
-            num_preds = 250
-            bfull = boxes[:wn*hn].reshape((wn, hn, num_preds, 4))
-            b2 = np.zeros(bfull.shape)
-            b2[:, :, :, 0] = bfull[:, :, :, 1]
-            b2[:, :, :, 1] = bfull[:, :, :, 0]
-            b2[:, :, :, 2] = bfull[:, :, :, 3]
-            b2[:, :, :, 3] = bfull[:, :, :, 2]
+                key = f
+                chip_time = chipEnd - chipStart
+                inference_time = detectionEnd - detectionStart
+                rescale_time = rescaleEnd - rescaleStart
+                complete_time = completeEnd - completeStart
 
-            bfull = b2
-            bfull[:, :, :, 0] *= cwn
-            bfull[:, :, :, 2] *= cwn
-            bfull[:, :, :, 1] *= chn
-            bfull[:, :, :, 3] *= chn
-            for i in range(wn):
-                for j in range(hn):
-                    bfull[i, j, :, 0] += j*cwn
-                    bfull[i, j, :, 2] += j*cwn
-
-                    bfull[i, j, :, 1] += i*chn
-                    bfull[i, j, :, 3] += i*chn
-
-            bfull = bfull.reshape((hn*wn, num_preds, 4))
-
-            rescaleEnd = time.time()
-
-            '''
-            #only display boxes with confidence > .5
-            bs = bfull[scores > .5]
-            cs = classes[scores>.5]
-            s = args.input.split("/")[::-1]
-            draw_bboxes(arr,bs,cs).save("p_bboxes/"+s[0].split(".")[0] + ".png")
-            '''
-
-            with open(basename + '.predictions.txt', 'w') as f:
-                for i in range(bfull.shape[0]):
-                    for j in range(bfull[i].shape[0]):
-                        # box should be xmin ymin xmax ymax
-                        box = bfull[i, j]
-                        class_prediction = classes[i, j]
-                        score_prediction = scores[i, j]
-                        f.write('%d %d %d %d %d %f \n' %
-                                (box[0], box[1], box[2], box[3], int(class_prediction), score_prediction))
-
-            completeEnd = time.time()
-
-            key = o.key
-            download_time = downloadEnd - downloadStart
-            chip_time = chipEnd - chipStart
-            inference_time = detectionEnd - detectionStart
-            rescale_time = rescaleEnd - rescaleStart
-            complete_time = completeEnd - completeStart
-
-            l.write(",".join(list(map(lambda x: str(x), [time.time(),
-                    key, download_time, chip_time, inference_time, rescale_time, complete_time]))) + "\n")
+                l = open(args.log, "a")
+                l.write(",".join(list(map(lambda x: str(x), [time.time(),
+                        key, 0, chip_time, inference_time, rescale_time, complete_time]))) + "\n")
+                l.close()
